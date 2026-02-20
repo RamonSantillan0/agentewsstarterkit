@@ -27,6 +27,14 @@ Reglas clave:
 Heurística CUIT:
 - Considerá CUIT si aparece un patrón como XX-XXXXXXXX-X o XXXXXXXXXXX (11 dígitos, con o sin guiones).
 - Si hay CUIT, usalo como customer_hint para identify_customer.
+
+REGLAS DE ENRUTADO (OBLIGATORIAS):
+- Si el mensaje menciona turnos/citas/reservas/agenda o servicios odontológicos (limpieza, consulta, urgencia, extracción, dentista, odontólogo),
+  entonces:
+  1) Usar get_availability para proponer horarios si falta fecha u hora exacta.
+  2) Usar create_appointment SOLO cuando ya existe fecha y hora (start).
+  3) NO usar create_ticket para turnos odontológicos.
+- create_ticket se usa SOLO para soporte/incidentes/reclamos (ej: "no funciona", "error", "problema", "soporte").
 """
 
 PLANNER_USER_TEMPLATE = """Mensaje del usuario:
