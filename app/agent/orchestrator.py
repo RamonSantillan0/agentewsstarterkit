@@ -254,20 +254,28 @@ class AgentOrchestrator:
 
                 # Write -> requires confirmation (persistida en MySQL)
                 if "write" in tool.scopes:
-                    token = self._create_confirmation(session_id=session_id, tool_name=tc.name, tool_args=tc.args)
-
-                    reply = (
-                        f"⚠️ Esta acción requiere confirmación.\n"
-                        f"- Acción: {tc.name}\n"
-                        f"- Datos: {json.dumps(tc.args, ensure_ascii=False)}\n\n"
-                        f"Si querés continuar, respondé: confirm {token}"
+                    conf = self._create_confirmation(
+                        session_id=session_id,
+                        tool_name=tc.name,
+                        tool_args=tc.args,
                     )
+
+                    code = conf["short_code"]
+
+                    reply = self._format_confirmation_prompt(tc.name, tc.args, code)
+
                     return self._finalize(
                         msg, session_id, request_id,
                         intent=plan.intent,
                         reply=reply,
                         missing=[],
-                        data={"pending_confirmation": {"token": token, "tool": tc.name}},
+                        data={
+                            "pending_confirmation": {
+                                "code": code,
+                                "token": conf["token"],
+                                "tool": tc.name,
+                            }
+                        },
                         debug={"plan": plan_dict} if self._debug_enabled() else None,
                     )
 
@@ -316,7 +324,7 @@ class AgentOrchestrator:
                 debug={"error": str(e)} if self._debug_enabled() else None,
             )
 
-    def _create_confirmation(self, session_id: str, tool_name: str, tool_args: Dict[str, Any]) -> str:
+    def _create_confirmation(self, session_id: str, tool_name: str, tool_args: Dict[str, Any]) -> Dict[str, str]:
         db = get_db_session()
         try:
             return confirmations_store.create(
@@ -324,7 +332,7 @@ class AgentOrchestrator:
                 session_id=session_id,
                 tool_name=tool_name,
                 tool_args=tool_args,
-                ttl_sec=self.settings.CONFIRMATION_TTL_SEC,  # ✅
+                ttl_sec=self.settings.CONFIRMATION_TTL_SEC,
             )
         finally:
             db.close()
@@ -501,6 +509,52 @@ class AgentOrchestrator:
             )
 
         return f"✅ Acción ejecutada: {tool_name}"
+    
+
+    def _format_confirmation_prompt(self, tool_name: str, tool_args: Dict[str, Any], token: str) -> str:
+        # Turnos: reservar
+        if tool_name == "create_appointment":
+            service = tool_args.get("service", "")
+            start = tool_args.get("start") or tool_args.get("start_at") or ""
+            return (
+                "🦷 *Confirmación de turno*\n"
+                f"• Servicio: *{service}*\n"
+                f"• Fecha y hora: *{start}*\n\n"
+                f"Para confirmar respondé:\n"
+                f"*confirm {token}*\n\n"
+                "Si querés cancelar, ignorá este mensaje."
+            )
+
+        # Turnos: cancelar
+        if tool_name == "cancel_appointment":
+            appt_id = tool_args.get("appointment_id") or ""
+            return (
+                "⚠️ *Confirmar cancelación*\n"
+                f"• Turno ID: *{appt_id}*\n\n"
+                f"Para confirmar respondé:\n"
+                f"*confirm {token}*"
+            )
+
+        # Turnos: reprogramar
+        if tool_name == "reschedule_appointment":
+            appt_id = tool_args.get("appointment_id") or ""
+            new_start = tool_args.get("new_start") or ""
+            return (
+                "🗓️ *Confirmar reprogramación*\n"
+                f"• Turno ID: *{appt_id}*\n"
+                f"• Nuevo horario: *{new_start}*\n\n"
+                f"Para confirmar respondé:\n"
+                f"*confirm {token}*"
+            )
+
+        # Default (para cualquier otra tool write)
+        return (
+            "⚠️ Esta acción requiere confirmación.\n"
+            f"Acción: {tool_name}\n"
+            f"Para confirmar respondé: confirm {token}"
+        )
+    
+
 
     def _debug_enabled(self) -> bool:
         return self.settings.ENV == "dev" and self.settings.EXPOSE_DEBUG
