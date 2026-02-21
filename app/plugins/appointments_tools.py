@@ -9,6 +9,8 @@ from sqlalchemy import text
 from app.infra.db import engine  # ✅ usar el engine global
 
 
+
+
 SLOT_MIN = 15
 
 
@@ -28,6 +30,19 @@ class CreateAppointmentInput(BaseModel):
 class ListAppointmentsInput(BaseModel):
     limit: int = Field(5, ge=1, le=20, description="Cantidad máxima de turnos a listar")
     status: Optional[str] = Field("booked", description="booked|cancelled|completed|all")
+
+
+class CancelAppointmentInput(BaseModel):
+    appointment_id: Optional[int] = Field(None, description="ID del turno a cancelar")
+    cancel_next: bool = Field(False, description="Si true, cancela el próximo turno booked del paciente")
+    reason: Optional[str] = Field(None, description="Motivo (opcional)")
+
+
+class RescheduleAppointmentInput(BaseModel):
+    appointment_id: int = Field(..., description="ID del turno a reprogramar")
+    new_start: str = Field(..., description="Nuevo inicio ISO: YYYY-MM-DDTHH:MM")
+    staff: Optional[str] = Field(None, description="Nuevo profesional (opcional)")
+
 
 def _parse_date(d: str) -> date:
     return datetime.strptime(d, "%Y-%m-%d").date()
@@ -228,6 +243,177 @@ class ListAppointmentsTool:
             })
 
         return {"ok": True, "appointments": appts, "count": len(appts)}
+    
+class CancelAppointmentTool:
+    name = "cancel_appointment"
+    description = (
+        "TURNOS ODONTOLÓGICOS. Cancelar un turno existente. "
+        "Usar cuando el usuario diga: cancelar turno, anular cita, no puedo ir. "
+        "Inputs: appointment_id o cancel_next=true."
+    )
+    input_model: Type[BaseModel] = CancelAppointmentInput
+    scopes: List[str] = ["write"]
+
+    async def run(self, args: BaseModel, ctx: Dict[str, Any]) -> Dict[str, Any]:
+        a: CancelAppointmentInput = args  # type: ignore
+        session_id = str(ctx.get("session_id") or "unknown")
+
+        appt_id = a.appointment_id
+
+        # Si pide cancelar próximo
+        if not appt_id and a.cancel_next:
+            q = text("""
+                SELECT id
+                FROM appointments
+                WHERE patient_session_id = :sid
+                  AND status = 'booked'
+                  AND start_at >= NOW()
+                ORDER BY start_at ASC
+                LIMIT 1
+            """)
+            with engine.begin() as conn:
+                row = conn.execute(q, {"sid": session_id}).fetchone()
+            if not row:
+                return {"ok": False, "error": "No encontré un turno próximo para cancelar."}
+            appt_id = int(row[0])
+
+        if not appt_id:
+            return {"ok": False, "error": "Falta appointment_id o cancel_next=true"}
+
+        # Verificar que el turno sea del paciente y esté booked
+        q_check = text("""
+            SELECT id, service_code, start_at, end_at, status
+            FROM appointments
+            WHERE id = :id AND patient_session_id = :sid
+            LIMIT 1
+        """)
+        with engine.begin() as conn:
+            row = conn.execute(q_check, {"id": appt_id, "sid": session_id}).fetchone()
+
+        if not row:
+            return {"ok": False, "error": "Turno no encontrado para tu sesión."}
+        if row[4] != "booked":
+            return {"ok": False, "error": f"El turno no está activo (status={row[4]})."}
+
+        q_upd = text("""
+            UPDATE appointments
+            SET status='cancelled', notes = CONCAT(IFNULL(notes,''), :note)
+            WHERE id=:id AND patient_session_id=:sid
+        """)
+        note = ""
+        if a.reason:
+            note = f"\n[CANCEL] {a.reason}"
+        else:
+            note = "\n[CANCEL]"
+
+        with engine.begin() as conn:
+            conn.execute(q_upd, {"id": appt_id, "sid": session_id, "note": note})
+
+        return {
+            "ok": True,
+            "appointment_id": appt_id,
+            "status": "cancelled",
+            "service": row[1],
+            "start": row[2].isoformat(timespec="minutes"),
+            "end": row[3].isoformat(timespec="minutes"),
+        }
+
+
+class RescheduleAppointmentTool:
+    name = "reschedule_appointment"
+    description = (
+        "TURNOS ODONTOLÓGICOS. Reprogramar un turno existente a otra fecha/hora. "
+        "Usar cuando el usuario diga: reprogramar, cambiar horario, mover turno. "
+        "Inputs: appointment_id + new_start."
+    )
+    input_model: Type[BaseModel] = RescheduleAppointmentInput
+    scopes: List[str] = ["write"]
+
+    async def run(self, args: BaseModel, ctx: Dict[str, Any]) -> Dict[str, Any]:
+        a: RescheduleAppointmentInput = args  # type: ignore
+        session_id = str(ctx.get("session_id") or "unknown")
+
+        new_start_at = datetime.fromisoformat(a.new_start.strip())
+
+        # Buscar turno y validar pertenencia
+        q = text("""
+            SELECT id, service_code, staff_id, status
+            FROM appointments
+            WHERE id = :id AND patient_session_id = :sid
+            LIMIT 1
+        """)
+        with engine.begin() as conn:
+            row = conn.execute(q, {"id": a.appointment_id, "sid": session_id}).fetchone()
+
+        if not row:
+            return {"ok": False, "error": "Turno no encontrado para tu sesión."}
+        if row[3] != "booked":
+            return {"ok": False, "error": f"El turno no está activo (status={row[3]})."}
+
+        service = row[1]
+        current_staff_id = row[2]
+
+        # staff opcional nuevo
+        staff_id = current_staff_id
+        staff_name = (a.staff or "").strip()
+        if staff_name:
+            sid = _staff_id_by_name(staff_name)
+            if sid is None:
+                return {"ok": False, "error": f"Profesional no encontrado: {staff_name}"}
+            staff_id = sid
+
+        duration_min = _service_duration_min(service)
+        new_end_at = new_start_at + timedelta(minutes=duration_min)
+
+        # Chequeo simple de choque si hay staff_id
+        if staff_id is not None:
+            q_conflict = text("""
+                SELECT id
+                FROM appointments
+                WHERE staff_id = :staff_id
+                  AND status='booked'
+                  AND start_at = :start_at
+                  AND id <> :id
+                LIMIT 1
+            """)
+            with engine.begin() as conn:
+                conflict = conn.execute(q_conflict, {
+                    "staff_id": staff_id,
+                    "start_at": new_start_at,
+                    "id": a.appointment_id,
+                }).fetchone()
+            if conflict:
+                return {"ok": False, "error": "Ese horario ya está ocupado para ese profesional."}
+
+        q_upd = text("""
+            UPDATE appointments
+            SET staff_id=:staff_id, start_at=:start_at, end_at=:end_at
+            WHERE id=:id AND patient_session_id=:sid
+        """)
+        with engine.begin() as conn:
+            conn.execute(q_upd, {
+                "staff_id": staff_id,
+                "start_at": new_start_at,
+                "end_at": new_end_at,
+                "id": a.appointment_id,
+                "sid": session_id,
+            })
+
+        return {
+            "ok": True,
+            "appointment_id": int(row[0]),
+            "status": "booked",
+            "service": service,
+            "new_start": new_start_at.isoformat(timespec="minutes"),
+            "new_end": new_end_at.isoformat(timespec="minutes"),
+            "staff_id": staff_id,
+        }
 
 def register():
-    return [GetAvailabilityTool(), CreateAppointmentTool(), ListAppointmentsTool()]
+    return [
+            GetAvailabilityTool(),
+            CreateAppointmentTool(),
+            ListAppointmentsTool(),
+            CancelAppointmentTool(),
+            RescheduleAppointmentTool(),
+    ]
