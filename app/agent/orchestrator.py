@@ -462,29 +462,44 @@ class AgentOrchestrator:
     def _format_write_result(self, tool_name: str, result: Dict[str, Any]) -> str:
         ok = result.get("ok", True)
         if not ok:
-            return f"❌ No pude completar la acción ({tool_name}).\nDetalle: {result.get('error') or result}"
+            err = result.get("error") or result.get("detail") or result
+            return f"❌ No pude completar la acción ({tool_name}).\n• Detalle: {err}"
 
-        # Turnos: create
+        # ✅ Turnos: reservar
         if tool_name == "create_appointment":
             appt_id = result.get("appointment_id")
-            return f"✅ Turno reservado.\n• ID: {appt_id}\n• Estado: reservado"
+            return (
+                "✅ Turno reservado.\n"
+                f"• ID: {appt_id}\n"
+                f"• Estado: reservado"
+            )
 
-        # Turnos: cancel
+        # ✅ Turnos: cancelar
         if tool_name == "cancel_appointment":
             appt_id = result.get("appointment_id")
             service = result.get("service", "")
             start = result.get("start", "")
-            return f"✅ Turno cancelado.\n• ID: {appt_id}\n• Servicio: {service}\n• Inicio: {start}"
+            end = result.get("end", "")
+            return (
+                "✅ Turno cancelado.\n"
+                f"• ID: {appt_id}\n"
+                f"• Servicio: {service}\n"
+                f"• Fecha y hora: {start} a {end}"
+            )
 
-        # Turnos: reschedule
+        # ✅ Turnos: reprogramar
         if tool_name == "reschedule_appointment":
             appt_id = result.get("appointment_id")
             service = result.get("service", "")
             new_start = result.get("new_start", "")
             new_end = result.get("new_end", "")
-            return f"✅ Turno reprogramado.\n• ID: {appt_id}\n• Servicio: {service}\n• Nuevo horario: {new_start} a {new_end}"
+            return (
+                "✅ Turno reprogramado.\n"
+                f"• ID: {appt_id}\n"
+                f"• Servicio: {service}\n"
+                f"• Nuevo horario: {new_start} a {new_end}"
+            )
 
-        # Default
         return f"✅ Acción ejecutada: {tool_name}"
 
     def _debug_enabled(self) -> bool:
