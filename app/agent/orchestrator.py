@@ -340,7 +340,8 @@ class AgentOrchestrator:
     def _consume_confirmation(self, token: str, session_id: str) -> Optional[Dict[str, Any]]:
         db = get_db_session()
         try:
-            return confirmations_store.consume(db, token=token, session_id=session_id)
+            # ✅ consume acepta token largo o short_code
+            return confirmations_store.consume(db, token_or_code=token, session_id=session_id)
         finally:
             db.close()
 
